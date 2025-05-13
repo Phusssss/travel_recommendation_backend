@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - MYSQL_HOST=db
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=your_password
+      - MYSQL_DATABASE=travel_recommendation
+      - ORS_API_KEY=5b3ce3597851110001cf62489456505cba234922ab8cdfbf51bf0632
+    depends_on:
+      - db
+    networks:
+      - travel-network
+
+  db:
+    image: mysql:8.0
+    environment:
+      - MYSQL_ROOT_PASSWORD=your_password
+      - MYSQL_DATABASE=travel_recommendation
+    volumes:
+      - db-data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "3306:3306"
+    networks:
+      - travel-network
+
+  phpmyadmin:
+    image: phpmyadmin:5.2
+    environment:
+      - PMA_HOST=db
+      - PMA_USER=root
+      - PMA_PASSWORD=your_password
+    ports:
+      - "8080:80"
+    depends_on:
+      - db
+    networks:
+      - travel-network
+
+volumes:
+  db-data:
+
+networks:
+  travel-network:
+    driver: bridge

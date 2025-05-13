@@ -1,0 +1,31 @@
+{
+  "destinations": [
+    {
+      "name": "Ho Xuan Huong",
+      "city": "Da Lat",
+      "type": "sightseeing",
+      "opening_hours": "24/7",
+      "ticket_price": 0,
+      "popularity": 8,
+      "coordinates": {"lat": 11.9411, "lon": 108.4378}
+    },
+    {
+      "name": "Thung Lung Tinh Yeu",
+      "city": "Da Lat",
+      "type": "sightseeing",
+      "opening_hours": "07:00-17:00",
+      "ticket_price": 100000,
+      "popularity": 7,
+      "coordinates": {"lat": 11.9689, "lon": 108.4494}
+    },
+    {
+      "name": "Dinh Bao Dai",
+      "city": "Da Lat",
+      "type": "sightseeing",
+      "opening_hours": "07:00-17:00",
+      "ticket_price": 50000,
+      "popularity": 6,
+      "coordinates": {"lat": 11.9475, "lon": 108.4317}
+    }
+  ]
+}
