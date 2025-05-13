@@ -1,5 +1,5 @@
-version: '3.8'
 
+version: '3.8'
 services:
   app:
     build:
@@ -8,11 +8,12 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - MYSQL_HOST=db
-      - MYSQL_USER=root
-      - MYSQL_PASSWORD=your_password
-      - MYSQL_DATABASE=travel_recommendation
+      - DB_HOST=db
+      - DB_USER=root
+      - DB_PASSWORD=your_password
+      - DB_NAME=travel_recommendation
       - ORS_API_KEY=5b3ce3597851110001cf62489456505cba234922ab8cdfbf51bf0632
+      - WEATHER_API_KEY=f45d404e8a927b961993a0cd9a641ce5
     depends_on:
       - db
     networks:

@@ -1,188 +1,149 @@
-import json
+
+import os
 import requests
 import mysql.connector
-from typing import Dict, Any, List
-from mysql.connector import Error
-import os
+from cachetools import TTLCache
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from requests.exceptions import HTTPError
+import logging
 
-# OpenWeatherMap API Key
-OPENWEATHER_API_KEY = "f45d404e8a927b961993a0cd9a641ce5"
+logger = logging.getLogger(__name__)
 
-# OpenRouteService API Key
-ORS_API_KEY = os.getenv("ORS_API_KEY")
+# Bộ nhớ đệm với thời gian sống 1 giờ, tối đa 1000 mục
+travel_time_cache = TTLCache(maxsize=1000, ttl=3600)
 
 def get_db_connection():
+    """Kết nối đến cơ sở dữ liệu MySQL."""
     try:
-        connection = mysql.connector.connect(
-            host=os.getenv("MYSQL_HOST", "localhost"),
-            user=os.getenv("MYSQL_USER", "root"),
-            password=os.getenv("MYSQL_PASSWORD", "your_password"),
-            database=os.getenv("MYSQL_DATABASE", "travel_recommendation")
+        conn = mysql.connector.connect(
+            host=os.getenv("DB_HOST", "db"),
+            user=os.getenv("DB_USER", "root"),
+            password=os.getenv("DB_PASSWORD"),
+            database=os.getenv("DB_NAME", "travel_recommendation")
         )
-        return connection
-    except Error as e:
-        print(f"Error connecting to MySQL: {e}")
-        return None
+        logger.info("Database connection established")
+        return conn
+    except mysql.connector.Error as e:
+        logger.error(f"Database connection failed: {e}")
+        raise
 
-def get_current_weather(city: str) -> Dict[str, Any]:
-    url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={OPENWEATHER_API_KEY}&units=metric"
+def get_coordinates(location: str) -> list:
+    """Lấy tọa độ (longitude, latitude) của một địa điểm từ database."""
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.HTTPError:
-        return {"error": "City not found or invalid request"}
-    except requests.exceptions.RequestException:
-        return {"error": "Network error or API unavailable"}
-
-def get_weather_forecast(city: str, days: int = 5) -> Dict[str, Any]:
-    if days > 5:
-        return {"error": "Forecast limited to 5 days"}
-    url = f"http://api.openweathermap.org/data/2.5/forecast?q={city}&appid={OPENWEATHER_API_KEY}&units=metric"
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        daily_forecast = [
-            item for item in data["list"]
-            if "12:00:00" in item["dt_txt"]
-        ][:days]
-        return {
-            "city": data["city"],
-            "forecast": daily_forecast
-        }
-    except requests.exceptions.HTTPError:
-        return {"error": "City not found or invalid request"}
-    except requests.exceptions.RequestException:
-        return {"error": "Network error or API unavailable"}
-
-def get_weather_by_coordinates(lat: float, lon: float) -> Dict[str, Any]:
-    url = f"http://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric"
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.HTTPError:
-        return {"error": "Invalid coordinates or request"}
-    except requests.exceptions.RequestException:
-        return {"error": "Network error or API unavailable"}
-def save_user_preferences(user_id: str, preferences: Dict[str, Any]) -> Dict[str, Any]:
-    connection = get_db_connection()
-    if not connection:
-        return {"error": "Database connection failed"}
-    
-    try:
-        cursor = connection.cursor()
+        conn = get_db_connection()
+        cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO users (user_id, preferences) VALUES (%s, %s) "
-            "ON DUPLICATE KEY UPDATE preferences = %s",
-            (user_id, json.dumps(preferences), json.dumps(preferences))
+            "SELECT latitude, longitude FROM destinations WHERE name = %s AND city = %s",
+            (location, "Da Lat")
         )
-        connection.commit()
-        return {"status": "Preferences saved successfully"}
-    except Error as e:
-        return {"error": f"Database error: {str(e)}"}
-    finally:
-        if connection.is_connected():
-            cursor.close()
-            connection.close()
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        if result:
+            return [result[1], result[0]]  # [longitude, latitude]
+        logger.warning(f"No coordinates found for {location}")
+        return [0, 0]
+    except Exception as e:
+        logger.error(f"Error in get_coordinates: {e}")
+        return [0, 0]
 
-def get_user_preferences(user_id: str) -> Dict[str, Any]:
-    connection = get_db_connection()
-    if not connection:
-        return {"error": "Database connection failed"}
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=4, max=60),
+    retry=retry_if_exception_type(HTTPError),
+    reraise=True
+)
+def get_travel_time(start_location: str, end_location: str) -> dict:
+    """Lấy thời gian di chuyển giữa hai địa điểm, ưu tiên cache và database."""
+    cache_key = f"{start_location}:{end_location}"
     
+    # Kiểm tra cache
+    if cache_key in travel_time_cache:
+        logger.info(f"Cache hit for travel time: {cache_key}")
+        return travel_time_cache[cache_key]
+
+    # Kiểm tra database
     try:
-        cursor = connection.cursor(dictionary=True)
-        cursor.execute("SELECT preferences FROM users WHERE user_id = %s", (user_id,))
-        user = cursor.fetchone()
-        if user:
-            return json.loads(user["preferences"])
-        return {"error": "User not found"}
-    except Error as e:
-        return {"error": f"Database error: {str(e)}"}
-    finally:
-        if connection.is_connected():
-            cursor.close()
-            connection.close()
-def geocode_location(location: str) -> Dict[str, Any]:
-    url = "https://nominatim.openstreetmap.org/search"
-    params = {
-        "q": location,
-        "format": "json",
-        "limit": 1
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT duration FROM travel_times WHERE city = %s AND start_location = %s AND end_location = %s",
+            ("Da Lat", start_location, end_location)
+        )
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        if result:
+            travel_time_cache[cache_key] = {"duration": result[0]}
+            logger.info(f"Database hit for travel time: {cache_key}")
+            return {"duration": result[0]}
+    except Exception as e:
+        logger.error(f"Error querying travel_times: {e}")
+
+    # Kiểm tra ORS_API_KEY
+    api_key = os.getenv("ORS_API_KEY")
+    if not api_key:
+        logger.error("ORS_API_KEY not set")
+        return {"error": "Missing ORS_API_KEY"}
+
+    # Gọi API OpenRouteService
+    headers = {"Authorization": api_key}
+    body = {
+        "coordinates": [
+            get_coordinates(start_location),
+            get_coordinates(end_location)
+        ]
     }
-    headers = {"User-Agent": "TravelRecommendation/1.0 (nphu764@gmail.com)"}
-    
     try:
-        response = requests.get(url, params=params, headers=headers)
+        response = requests.post(
+            "https://api.openrouteservice.org/v2/directions/driving-car/geojson",
+            json=body,
+            headers=headers,
+        )
         response.raise_for_status()
         data = response.json()
-        if data:
-            return {
-                "lat": float(data[0]["lat"]),
-                "lon": float(data[0]["lon"])
-            }
-        return {"error": "Location not found"}
-    except requests.exceptions.RequestException:
-        return {"error": "Geocoding error"}
+        duration = data["features"][0]["properties"]["summary"]["duration"]
+        result = {"duration": f"{duration / 60:.2f} mins"}
 
-def get_travel_time(origin: str, destination: str, mode: str = "driving") -> Dict[str, Any]:
-    connection = get_db_connection()
-    if not connection:
-        return {"error": "Database connection failed"}
-    
+        # Lưu vào database
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO travel_times (city, start_location, end_location, duration) VALUES (%s, %s, %s, %s)",
+                ("Da Lat", start_location, end_location, result["duration"])
+            )
+            conn.commit()
+            cursor.close()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error saving to travel_times: {e}")
+
+        travel_time_cache[cache_key] = result
+        return result
+    except HTTPError as e:
+        if response.status_code in (429, 404):
+            logger.error(f"HTTP error in get_travel_time: {e}")
+            if response.status_code == 429:
+                raise
+            return {"duration": "N/A"}
+        return {"error": f"Cannot calculate travel time: {e}"}
+    except Exception as e:
+        logger.error(f"Error in get_travel_time: {e}")
+        return {"error": f"Cannot calculate travel time: {e}"}
+
+def get_current_weather(location: str) -> dict:
+    """Lấy thông tin thời tiết hiện tại cho một địa điểm."""
+    api_key = os.getenv("WEATHER_API_KEY")
+    if not api_key:
+        logger.error("WEATHER_API_KEY not set")
+        return {"error": "Missing WEATHER_API_KEY"}
     try:
-        cursor = connection.cursor(dictionary=True)
-        cursor.execute("SELECT name, lat, lon FROM destinations WHERE name = %s", (origin,))
-        origin_data = cursor.fetchone()
-        cursor.execute("SELECT name, lat, lon FROM destinations WHERE name = %s", (destination,))
-        destination_data = cursor.fetchone()
-        
-        if not origin_data or not destination_data:
-            origin_coords = geocode_location(origin)
-            destination_coords = geocode_location(destination)
-            if "error" in origin_coords or "error" in destination_coords:
-                return {"error": "Invalid origin or destination"}
-        else:
-            origin_coords = {"lat": origin_data["lat"], "lon": origin_data["lon"]}
-            destination_coords = {"lat": destination_data["lat"], "lon": destination_data["lon"]}
-        
-        ors_mode = {
-            "driving": "driving-car",
-            "walking": "foot-walking",
-            "bicycling": "cycling-regular"
-        }.get(mode, "driving-car")
-        
-        url = f"https://api.openrouteservice.org/v2/directions/{ors_mode}/geojson"
-        headers = {"Authorization": ORS_API_KEY}
-        payload = {
-            "coordinates": [
-                [origin_coords["lon"], origin_coords["lat"]],
-                [destination_coords["lon"], destination_coords["lat"]]
-            ]
-        }
-        
-        response = requests.post(url, json=payload, headers=headers)
+        url = f"http://api.openweathermap.org/data/2.5/weather?q={location},VN&appid={api_key}&units=metric"
+        response = requests.get(url)
         response.raise_for_status()
         data = response.json()
-        duration = data["features"][0]["properties"]["segments"][0]["duration"]
-        distance = data["features"][0]["properties"]["segments"][0]["distance"]
-        
-        return {
-            "origin": origin,
-            "destination": destination,
-            "distance": f"{distance / 1000:.2f} km",
-            "duration": f"{duration / 60:.2f} mins",
-            "duration_seconds": duration
-        }
-    except requests.exceptions.HTTPError as e:
-        return {"error": f"Cannot calculate travel time: {str(e)}"}
-    except requests.exceptions.RequestException:
-        return {"error": "Network error or API unavailable"}
-    except Error as e:
-        return {"error": f"Database error: {str(e)}"}
-    finally:
-        if connection.is_connected():
-            cursor.close()
-            connection.close()
+        return {"description": data["weather"][0]["description"]}
+    except Exception as e:
+        logger.error(f"Error in get_current_weather: {e}")
+        return {"error": f"Cannot get weather: {e}"}
