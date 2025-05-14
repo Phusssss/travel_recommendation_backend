@@ -1,4 +1,3 @@
-
 version: '3.8'
 services:
   app:
@@ -7,41 +6,40 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
-    environment:
-      - DB_HOST=db
-      - DB_USER=root
-      - DB_PASSWORD=your_password
-      - DB_NAME=travel_recommendation
-      - ORS_API_KEY=5b3ce3597851110001cf62489456505cba234922ab8cdfbf51bf0632
-      - WEATHER_API_KEY=f45d404e8a927b961993a0cd9a641ce5
+    env_file:
+      - .env
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     networks:
       - travel-network
 
   db:
     image: mysql:8.0
-    environment:
-      - MYSQL_ROOT_PASSWORD=your_password
-      - MYSQL_DATABASE=travel_recommendation
+    env_file:
+      - .env
     volumes:
       - db-data:/var/lib/mysql
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
       - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     networks:
       - travel-network
 
   phpmyadmin:
     image: phpmyadmin:5.2
-    environment:
-      - PMA_HOST=db
-      - PMA_USER=root
-      - PMA_PASSWORD=your_password
+    env_file:
+      - .env
     ports:
       - "8080:80"
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     networks:
       - travel-network
 
