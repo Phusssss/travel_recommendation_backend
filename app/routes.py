@@ -442,3 +442,98 @@ async def submit_review(request: dict = Body(...)):
     except Exception as e:
         logger.error("Review submission failed", error=str(e))
         raise HTTPException(status_code=500, detail=f"Failed to submit review: {str(e)}")
+    
+@router.post("/route")
+async def get_route_directions(request: dict = Body(...)):
+    """Lấy hướng dẫn tuyến đường từ ORS."""
+    api_key = os.getenv("ORS_API_KEY")
+    if not api_key:
+        logger.error("ORS_API_KEY not set")
+        raise HTTPException(status_code=500, detail="Missing ORS_API_KEY")
+
+    coordinates = request.get("coordinates")  # [[lon, lat], [lon, lat], ...]
+    if not coordinates or len(coordinates) < 2:
+        logger.error("Invalid coordinates", coordinates=coordinates)
+        raise HTTPException(status_code=400, detail="At least two coordinates are required")
+
+    # Method 1: API key as URL parameter
+    url = f"https://api.openrouteservice.org/v2/directions/driving-car/geojson?api_key={api_key}"
+    headers = {"Content-Type": "application/json"}
+    body = {"coordinates": coordinates}
+    
+    # Debug logging
+    logger.info("Requesting route", url=url.replace(api_key, "API_KEY_HIDDEN"), coordinates=coordinates)
+    
+    try:
+        response = requests.post(url, json=body, headers=headers)
+        
+        # Log detailed info for debugging
+        status_code = response.status_code
+        logger.info("ORS API response", status_code=status_code)
+        
+        if status_code != 200:
+            error_text = response.text
+            logger.error("ORS API error", status_code=status_code, response=error_text[:500])
+            raise HTTPException(
+                status_code=status_code, 
+                detail=f"ORS API returned status {status_code}: {error_text[:500]}"
+            )
+            
+        data = response.json()
+        
+        # Extract route data from GeoJSON response
+        features = data.get("features", [])
+        if not features:
+            logger.error("No route features in response", data=data)
+            raise HTTPException(status_code=404, detail="No routes found")
+            
+        # Extract route geometry and properties
+        route = features[0]
+        geometry = route.get("geometry", {}).get("coordinates", [])
+        properties = route.get("properties", {})
+        
+        # Extract steps if available
+        segments = properties.get("segments", [])
+        steps = segments[0].get("steps", []) if segments else []
+        
+        instructions = [
+            {
+                "text": translate_instruction(step.get("instruction", "Unknown")),
+                "distance": step.get("distance", 0),
+                "duration": step.get("duration", 0)
+            }
+            for step in steps
+        ]
+        
+        return {
+            "coordinates": geometry,
+            "instructions": instructions,
+            "summary": {
+                "distance": properties.get("summary", {}).get("distance", 0),
+                "duration": properties.get("summary", {}).get("duration", 0)
+            }
+        }
+        
+    except requests.exceptions.RequestException as e:
+        logger.error("Request to ORS failed", error=str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to communicate with routing service: {str(e)}")
+    except ValueError as e:
+        logger.error("Invalid JSON response", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Invalid response from routing service: {str(e)}")
+    except Exception as e:
+        logger.error("Unexpected error", error=str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+def translate_instruction(instruction: str) -> str:
+    """Dịch hướng dẫn sang tiếng Việt (cơ bản)."""
+    translations = {
+        "Turn left": "Rẽ trái",
+        "Turn right": "Rẽ phải",
+        "Continue": "Tiếp tục đi thẳng",
+        "Take the ramp": "Đi vào đường dẫn",
+        "Arrive at destination": "Đến nơi",
+        "Head": "Đi thẳng",
+        "Turn around": "Quay đầu",
+        "Enter roundabout": "Vào vòng xuyến",
+        "Exit roundabout": "Rời vòng xuyến"
+    }
+    return translations.get(instruction, instruction)
