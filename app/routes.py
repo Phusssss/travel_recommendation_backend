@@ -8,9 +8,21 @@ from fastapi import APIRouter, HTTPException, Body, Query
 from app.services import get_current_weather, get_travel_time, get_coordinates
 from transformers import pipeline
 import structlog
+import unicodedata
+import re
 
 router = APIRouter()
 logger = structlog.get_logger()
+
+def preprocess_vietnamese_text(text: str) -> str:
+    """Tiền xử lý văn bản tiếng Việt: chuẩn hóa dấu và loại bỏ ký tự đặc biệt."""
+    # Chuẩn hóa Unicode (NFC)
+    text = unicodedata.normalize('NFC', text)
+    # Chuyển thành chữ thường
+    text = text.lower()
+    # Loại bỏ ký tự đặc biệt, giữ chữ và số
+    text = re.sub(r'[^\w\s]', '', text)
+    return text
 
 class TravelRecommender:
     def __init__(self, city: str):
@@ -20,8 +32,12 @@ class TravelRecommender:
         self.destinations = []
         self.n_states = 0
         self.q_table = None
-        # Sử dụng mô hình đa ngôn ngữ để hỗ trợ tiếng Việt
-        self.sentiment_analyzer = pipeline("sentiment-analysis", model="nlptown/bert-base-multilingual-uncased-sentiment")
+        # Sử dụng mô hình multilingual cho phân tích cảm xúc
+        self.sentiment_analyzer = pipeline(
+            "sentiment-analysis",
+            model="nlptown/bert-base-multilingual-uncased-sentiment",
+            device=-1
+        )
         self.load_destinations()
 
     def get_city_id(self, city: str) -> int:
@@ -48,7 +64,7 @@ class TravelRecommender:
             raise
 
     def load_destinations(self):
-        """Tải danh sách địa điểm từ database và tính điểm cảm xúc."""
+        """Tải danh sách địa điểm từ database và sử dụng sentiment_score nếu có."""
         try:
             conn = mysql.connector.connect(
                 host=os.getenv("DB_HOST", "db"),
@@ -66,9 +82,25 @@ class TravelRecommender:
             if not self.destinations:
                 logger.error("No destinations found", city=self.city)
                 raise ValueError(f"No destinations found for city {self.city}")
-            # Tính điểm cảm xúc cho mỗi địa điểm
+            # Tính sentiment_score nếu chưa có
             for dest in self.destinations:
-                dest["sentiment_score"] = self.calculate_destination_sentiment(dest["id"])
+                if dest["sentiment_score"] is None:
+                    dest["sentiment_score"] = self.calculate_destination_sentiment(dest["id"])
+                    # Lưu vào database
+                    conn = mysql.connector.connect(
+                        host=os.getenv("DB_HOST", "db"),
+                        user=os.getenv("DB_USER", "root"),
+                        password=os.getenv("DB_PASSWORD"),
+                        database=os.getenv("DB_NAME", "travel_recommendation")
+                    )
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "UPDATE destinations SET sentiment_score = %s WHERE id = %s",
+                        (dest["sentiment_score"], dest["id"])
+                    )
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
         except Exception as e:
             logger.error("Error loading destinations", error=str(e))
             raise
@@ -85,18 +117,24 @@ class TravelRecommender:
             cursor = conn.cursor()
             cursor.execute("SELECT review_text FROM reviews WHERE destination_id = %s", (destination_id,))
             reviews = [row[0] for row in cursor.fetchall()]
+            logger.info("Fetched reviews", destination_id=destination_id, reviews=reviews, count=len(reviews))
             cursor.close()
             conn.close()
             if not reviews:
-                return 0.0  # Điểm trung tính nếu không có bình luận
+                logger.info("No reviews found", destination_id=destination_id)
+                return 0.0
+            # Tiền xử lý bình luận
+            processed_reviews = [preprocess_vietnamese_text(review) for review in reviews]
+            logger.info("Processed reviews", destination_id=destination_id, processed_reviews=processed_reviews)
             # Phân tích cảm xúc
-            sentiments = self.sentiment_analyzer(reviews)
+            sentiments = self.sentiment_analyzer(processed_reviews)
+            logger.info("Sentiment analysis results", destination_id=destination_id, sentiments=sentiments)
             # Chuyển điểm từ 1-5 sang [-1, 1]
             avg_score = sum((int(s["label"].split()[0]) - 3) / 2.0 for s in sentiments) / len(sentiments)
             logger.info("Calculated sentiment score", destination_id=destination_id, score=avg_score)
             return avg_score
         except Exception as e:
-            logger.error("Error calculating sentiment", error=str(e))
+            logger.error("Error calculating sentiment", error=str(e), exc_info=True)
             return 0.0
 
     def load_q_table(self):
@@ -335,7 +373,7 @@ async def get_location_coordinates(
 
 @router.post("/submit_review")
 async def submit_review(request: dict = Body(...)):
-    """Endpoint để gửi bình luận cho một địa điểm và cập nhật điểm cảm xúc."""
+    """Endpoint để gửi bình luận cho một địa điểm, lưu điểm cảm xúc vào reviews và cập nhật điểm tổng trong destinations."""
     city = request.get("city")
     destination_name = request.get("destination_name")
     review_text = request.get("review_text")
@@ -365,20 +403,39 @@ async def submit_review(request: dict = Body(...)):
             raise ValueError(f"Destination {destination_name} not found in {city}")
 
         destination_id = result[0]
-        # Thêm bình luận
+        logger.info("Found destination", destination_id=destination_id, destination_name=destination_name)
+
+        # Tính sentiment_score cho bình luận
+        recommender = TravelRecommender(city)
+        processed_review = preprocess_vietnamese_text(review_text)
+        sentiment_result = recommender.sentiment_analyzer([processed_review])[0]
+        sentiment_score = (int(sentiment_result["label"].split()[0]) - 3) / 2.0
+        logger.info("Calculated sentiment score for review", review_text=review_text, sentiment_score=sentiment_score)
+
+        # Thêm bình luận cùng với sentiment_score vào bảng reviews
         cursor.execute(
-            "INSERT INTO reviews (destination_id, review_text, created_at) VALUES (%s, %s, NOW())",
-            (destination_id, review_text)
+            "INSERT INTO reviews (destination_id, review_text, sentiment_score, created_at) "
+            "VALUES (%s, %s, %s, NOW())",
+            (destination_id, review_text, sentiment_score)
         )
+
+        # Cập nhật sentiment_score tổng trong bảng destinations
+        cursor.execute(
+            "UPDATE destinations SET sentiment_score = COALESCE(sentiment_score, 0) + %s WHERE id = %s",
+            (sentiment_score, destination_id)
+        )
+
         conn.commit()
         cursor.close()
         conn.close()
-
-        # Cập nhật điểm cảm xúc
-        recommender = TravelRecommender(city)
-        sentiment_score = recommender.calculate_destination_sentiment(destination_id)
-        logger.info("Review submitted and sentiment updated", destination_name=destination_name, sentiment_score=sentiment_score)
-        return {"message": f"Review submitted for {destination_name}", "sentiment_score": sentiment_score}
+        logger.info("Review submitted and sentiment updated", 
+                    destination_name=destination_name, 
+                    review_sentiment_score=sentiment_score)
+        
+        return {
+            "message": f"Review submitted for {destination_name}",
+            "sentiment_score": sentiment_score
+        }
     except ValueError as e:
         logger.error("Review submission failed", error=str(e))
         raise HTTPException(status_code=400, detail=str(e))

@@ -1,3 +1,4 @@
+
 import os
 import requests
 import mysql.connector
@@ -6,7 +7,6 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from requests.exceptions import HTTPError
 import structlog
 
-# Cấu hình structlog
 structlog.configure(
     processors=[
         structlog.processors.TimeStamper(fmt="iso"),
@@ -20,12 +20,9 @@ structlog.configure(
 )
 
 logger = structlog.get_logger()
-
-# Bộ nhớ đệm với thời gian sống 1 giờ, tối đa 1000 mục
 travel_time_cache = TTLCache(maxsize=1000, ttl=3600)
 
 def get_db_connection():
-    """Kết nối đến cơ sở dữ liệu MySQL."""
     try:
         conn = mysql.connector.connect(
             host=os.getenv("DB_HOST", "db"),
@@ -40,7 +37,6 @@ def get_db_connection():
         raise
 
 def get_city_id(city: str) -> int:
-    """Lấy city_id từ bảng cities dựa trên tên thành phố."""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -58,7 +54,6 @@ def get_city_id(city: str) -> int:
         raise
 
 def get_coordinates(location: str, city: str) -> list:
-    """Lấy tọa độ (longitude, latitude) của một địa điểm từ database hoặc ORS Geocoding."""
     city_id = get_city_id(city)
     try:
         conn = get_db_connection()
@@ -79,11 +74,9 @@ def get_coordinates(location: str, city: str) -> list:
     except Exception as e:
         logger.error("Error querying coordinates", error=str(e))
 
-    # Gọi ORS Geocoding nếu không tìm thấy trong database
     coords = get_ors_coordinates(location, city)
     if coords:
         lat, lon = coords
-        # Lưu tọa độ vào database
         try:
             conn = get_db_connection()
             cursor = conn.cursor()
@@ -101,7 +94,6 @@ def get_coordinates(location: str, city: str) -> list:
     return None
 
 def get_ors_coordinates(location: str, city: str, country: str = "Vietnam") -> tuple:
-    """Lấy tọa độ từ OpenRouteService Geocoding API."""
     api_key = os.getenv("ORS_API_KEY")
     if not api_key:
         logger.error("ORS_API_KEY not set")
@@ -118,7 +110,7 @@ def get_ors_coordinates(location: str, city: str, country: str = "Vietnam") -> t
         data = response.json()
         if data["features"]:
             coords = data["features"][0]["geometry"]["coordinates"]
-            return coords[1], coords[0]  # latitude, longitude
+            return coords[1], coords[0]
         logger.warning("No coordinates found", location=location)
         return None
     except Exception as e:
@@ -132,16 +124,13 @@ def get_ors_coordinates(location: str, city: str, country: str = "Vietnam") -> t
     reraise=True
 )
 def get_travel_time(start_location: str, end_location: str, city: str) -> dict:
-    """Lấy thời gian di chuyển giữa hai địa điểm, ưu tiên cache và database."""
     city_id = get_city_id(city)
     cache_key = f"{city_id}:{start_location}:{end_location}"
     
-    # Kiểm tra cache
     if cache_key in travel_time_cache:
         logger.info("Cache hit for travel time", cache_key=cache_key)
         return travel_time_cache[cache_key]
 
-    # Kiểm tra database
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -150,7 +139,7 @@ def get_travel_time(start_location: str, end_location: str, city: str) -> dict:
             (city_id, start_location, end_location)
         )
         result = cursor.fetchone()
-        if result and result[1]:  # Kiểm tra thời gian cập nhật
+        if result and result[1]:
             duration, updated_at = result
             travel_time_cache[cache_key] = {"duration": duration}
             logger.info("Database hit for travel time", cache_key=cache_key)
@@ -162,20 +151,17 @@ def get_travel_time(start_location: str, end_location: str, city: str) -> dict:
     except Exception as e:
         logger.error("Error querying travel_times", error=str(e))
 
-    # Kiểm tra tọa độ
     start_coords = get_coordinates(start_location, city)
     end_coords = get_coordinates(end_location, city)
     if not start_coords or not end_coords:
         logger.error("Invalid coordinates", start_location=start_location, end_location=end_location)
         return {"duration": "N/A"}
 
-    # Kiểm tra ORS_API_KEY
     api_key = os.getenv("ORS_API_KEY")
     if not api_key:
         logger.error("ORS_API_KEY not set")
         return {"error": "Missing ORS_API_KEY"}
 
-    # Gọi API OpenRouteService
     headers = {"Authorization": api_key}
     body = {"coordinates": [start_coords, end_coords]}
     try:
@@ -189,7 +175,6 @@ def get_travel_time(start_location: str, end_location: str, city: str) -> dict:
         duration = data["features"][0]["properties"]["summary"]["duration"]
         result = {"duration": f"{duration / 60:.2f} mins"}
 
-        # Lưu vào database
         try:
             conn = get_db_connection()
             cursor = conn.cursor()
@@ -219,7 +204,6 @@ def get_travel_time(start_location: str, end_location: str, city: str) -> dict:
         return {"error": f"Cannot calculate travel time: {e}"}
 
 def get_current_weather(city: str) -> dict:
-    """Lấy thông tin thời tiết hiện tại cho một thành phố."""
     api_key = os.getenv("WEATHER_API_KEY")
     if not api_key:
         logger.error("WEATHER_API_KEY not set")
@@ -236,4 +220,3 @@ def get_current_weather(city: str) -> dict:
     except Exception as e:
         logger.error("Error in get_current_weather", error=str(e), city=city)
         return {"error": f"Cannot get weather: {e}"}
-    
