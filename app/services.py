@@ -126,9 +126,9 @@ def get_ors_coordinates(location: str, city: str, country: str = "Vietnam") -> t
         return None
 
 @retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=1, min=4, max=60),
-    retry=retry_if_exception_type(HTTPError),
+    stop=stop_after_attempt(8),
+    wait=wait_exponential(multiplier=2, min=4, max=120),
+    retry=retry_if_exception_type((HTTPError, requests.exceptions.ConnectionError)),
     reraise=True
 )
 def get_travel_time(start_location: str, end_location: str, city: str) -> dict:

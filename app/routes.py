@@ -1,24 +1,27 @@
+
 import requests
-from app.services import get_current_weather, get_travel_time
-from fastapi import APIRouter, HTTPException, Body, Query
-import numpy as np
-import mysql.connector
 import os
 import json
+import mysql.connector
+import numpy as np
+from fastapi import APIRouter, HTTPException, Body, Query
+from app.services import get_current_weather, get_travel_time, get_coordinates
+from transformers import pipeline
 import structlog
-from urllib.error import HTTPError
 
 router = APIRouter()
 logger = structlog.get_logger()
 
 class TravelRecommender:
     def __init__(self, city: str):
-        """Khởi tạo TravelRecommender với danh sách địa điểm và Q-table."""
+        """Khởi tạo TravelRecommender với danh sách địa điểm, Q-table và phân tích cảm xúc."""
         self.city = city
         self.city_id = self.get_city_id(city)
         self.destinations = []
         self.n_states = 0
         self.q_table = None
+        # Sử dụng mô hình đa ngôn ngữ để hỗ trợ tiếng Việt
+        self.sentiment_analyzer = pipeline("sentiment-analysis", model="nlptown/bert-base-multilingual-uncased-sentiment")
         self.load_destinations()
 
     def get_city_id(self, city: str) -> int:
@@ -45,7 +48,7 @@ class TravelRecommender:
             raise
 
     def load_destinations(self):
-        """Tải danh sách địa điểm từ database."""
+        """Tải danh sách địa điểm từ database và tính điểm cảm xúc."""
         try:
             conn = mysql.connector.connect(
                 host=os.getenv("DB_HOST", "db"),
@@ -63,9 +66,38 @@ class TravelRecommender:
             if not self.destinations:
                 logger.error("No destinations found", city=self.city)
                 raise ValueError(f"No destinations found for city {self.city}")
+            # Tính điểm cảm xúc cho mỗi địa điểm
+            for dest in self.destinations:
+                dest["sentiment_score"] = self.calculate_destination_sentiment(dest["id"])
         except Exception as e:
             logger.error("Error loading destinations", error=str(e))
             raise
+
+    def calculate_destination_sentiment(self, destination_id: int) -> float:
+        """Tính điểm cảm xúc trung bình cho một địa điểm dựa trên bình luận."""
+        try:
+            conn = mysql.connector.connect(
+                host=os.getenv("DB_HOST", "db"),
+                user=os.getenv("DB_USER", "root"),
+                password=os.getenv("DB_PASSWORD"),
+                database=os.getenv("DB_NAME", "travel_recommendation")
+            )
+            cursor = conn.cursor()
+            cursor.execute("SELECT review_text FROM reviews WHERE destination_id = %s", (destination_id,))
+            reviews = [row[0] for row in cursor.fetchall()]
+            cursor.close()
+            conn.close()
+            if not reviews:
+                return 0.0  # Điểm trung tính nếu không có bình luận
+            # Phân tích cảm xúc
+            sentiments = self.sentiment_analyzer(reviews)
+            # Chuyển điểm từ 1-5 sang [-1, 1]
+            avg_score = sum((int(s["label"].split()[0]) - 3) / 2.0 for s in sentiments) / len(sentiments)
+            logger.info("Calculated sentiment score", destination_id=destination_id, score=avg_score)
+            return avg_score
+        except Exception as e:
+            logger.error("Error calculating sentiment", error=str(e))
+            return 0.0
 
     def load_q_table(self):
         """Tải Q-table từ database."""
@@ -116,11 +148,11 @@ class TravelRecommender:
             logger.error("Error saving Q-table", error=str(e))
 
     def train(self, episodes: int, user_prefs: dict = None):
-        """Huấn luyện mô hình Q-learning."""
+        """Huấn luyện mô hình Q-learning với điểm cảm xúc."""
         self.load_q_table()
-        alpha = 0.1  # Learning rate
-        gamma = 0.9  # Discount factor
-        epsilon = 0.1  # Exploration rate
+        alpha = 0.1  # Tỷ lệ học
+        gamma = 0.9  # Hệ số chiết khấu
+        epsilon = 0.1  # Tỷ lệ khám phá
         user_prefs = user_prefs or {}
         for episode in range(episodes):
             current_state = np.random.randint(self.n_states)
@@ -149,7 +181,7 @@ class TravelRecommender:
         self.save_q_table()
 
     def calculate_reward(self, weather: dict, travel_time: dict, destination: dict, user_prefs: dict) -> float:
-        """Tính phần thưởng dựa trên thời tiết, thời gian di chuyển, và sở thích người dùng."""
+        """Tính phần thưởng dựa trên thời tiết, thời gian di chuyển, sở thích và cảm xúc."""
         reward = 0
         if "clear" in weather.get("description", "").lower():
             reward += 10
@@ -165,10 +197,12 @@ class TravelRecommender:
         ticket_price = destination.get("ticket_price", 0)
         reward -= ticket_price / 10000
         reward += destination.get("popularity", 0) * 2
+        # Thêm điểm cảm xúc vào phần thưởng
+        reward += destination.get("sentiment_score", 0.0) * 10
         return reward
 
     def recommend_route(self, user_prefs: dict, steps: int) -> list:
-        """Đề xuất lộ trình du lịch dựa trên Q-table và sở thích người dùng."""
+        """Đề xuất lộ trình du lịch dựa trên Q-table, sở thích và cảm xúc."""
         if self.q_table is None:
             self.load_q_table()
         if not np.any(self.q_table):
@@ -224,7 +258,8 @@ class TravelRecommender:
                 "weather": weather.get("description", "N/A"),
                 "temperature": weather.get("temperature", "N/A"),
                 "travel_time": travel_time.get("duration", "N/A"),
-                "ticket_price": ticket_price
+                "ticket_price": ticket_price,
+                "sentiment_score": self.destinations[action].get("sentiment_score", 0.0)
             })
             visited.add(destination)
             current_state = action
@@ -284,7 +319,6 @@ async def get_location_coordinates(
     """Endpoint để lấy tọa độ của một địa điểm."""
     logger.info("Received coordinates request", location=location, city=city)
     try:
-        from app.services import get_coordinates
         coords = get_coordinates(location, city)
         if not coords:
             raise HTTPException(status_code=404, detail=f"Coordinates not found for {location} in {city}")
@@ -299,76 +333,55 @@ async def get_location_coordinates(
         logger.error("Coordinates request failed", error=str(e))
         raise HTTPException(status_code=500, detail=f"Failed to get coordinates: {str(e)}")
 
-@router.post("/route")
-async def get_route_directions(request: dict = Body(...)):
-    """Lấy hướng dẫn tuyến đường từ ORS."""
-    api_key = os.getenv("ORS_API_KEY")
-    if not api_key:
-        logger.error("ORS_API_KEY not set")
-        raise HTTPException(status_code=500, detail="Missing ORS_API_KEY")
+@router.post("/submit_review")
+async def submit_review(request: dict = Body(...)):
+    """Endpoint để gửi bình luận cho một địa điểm và cập nhật điểm cảm xúc."""
+    city = request.get("city")
+    destination_name = request.get("destination_name")
+    review_text = request.get("review_text")
 
-    coordinates = request.get("coordinates")  # [[lon, lat], [lon, lat], ...]
-    if not coordinates or len(coordinates) < 2:
-        logger.error("Invalid coordinates")
-        raise HTTPException(status_code=400, detail="At least two coordinates are required")
+    if not all([city, destination_name, review_text]):
+        logger.error("Missing required parameters", request=request)
+        raise HTTPException(status_code=400, detail="City, destination_name, and review_text are required")
 
-    headers = {"Authorization": api_key, "Content-Type": "application/json"}
-    body = {"coordinates": coordinates}
     try:
-        response = requests.post(
-            "https://api.openrouteservice.org/v2/directions/driving-car",
-            json=body,
-            headers=headers,
+        # Lấy city_id và destination_id
+        city_id = TravelRecommender(city).city_id
+        conn = mysql.connector.connect(
+            host=os.getenv("DB_HOST", "db"),
+            user=os.getenv("DB_USER", "root"),
+            password=os.getenv("DB_PASSWORD"),
+            database=os.getenv("DB_NAME", "travel_recommendation")
         )
-        response.raise_for_status()
-        data = response.json()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id FROM destinations WHERE name = %s AND city_id = %s",
+            (destination_name, city_id)
+        )
+        result = cursor.fetchone()
+        if not result:
+            cursor.close()
+            conn.close()
+            raise ValueError(f"Destination {destination_name} not found in {city}")
 
-        # Kiểm tra xem data có phải là dictionary không
-        if not isinstance(data, dict):
-            logger.error("Invalid response from ORS", response=data)
-            raise HTTPException(status_code=500, detail=f"Invalid response format from ORS: {data}")
+        destination_id = result[0]
+        # Thêm bình luận
+        cursor.execute(
+            "INSERT INTO reviews (destination_id, review_text, created_at) VALUES (%s, %s, NOW())",
+            (destination_id, review_text)
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
 
-        # Lấy thông tin tuyến đường
-        routes = data.get("routes", [])
-        if not routes:
-            logger.error("No routes found in ORS response")
-            raise HTTPException(status_code=404, detail="No routes found in ORS response")
-
-        # Lấy tọa độ và hướng dẫn
-        instructions = routes[0].get("segments", [{}])[0].get("steps", [])
-        translated_instructions = [
-            {
-                "text": translate_instruction(step.get("instruction", "Unknown")),
-                "distance": step.get("distance", 0),
-                "duration": step.get("duration", 0)
-            }
-            for step in instructions
-        ]
-        return {
-            "coordinates": routes[0].get("geometry", {}).get("coordinates", []),
-            "instructions": translated_instructions
-        }
-    except requests.HTTPError as e:
-        error_detail = str(e)
-        if e.response:
-            error_detail += f" - {e.response.text}"
-        logger.error("Error fetching route directions", error=error_detail)
-        raise HTTPException(status_code=500, detail=f"Failed to get route directions: {error_detail}")
+        # Cập nhật điểm cảm xúc
+        recommender = TravelRecommender(city)
+        sentiment_score = recommender.calculate_destination_sentiment(destination_id)
+        logger.info("Review submitted and sentiment updated", destination_name=destination_name, sentiment_score=sentiment_score)
+        return {"message": f"Review submitted for {destination_name}", "sentiment_score": sentiment_score}
+    except ValueError as e:
+        logger.error("Review submission failed", error=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error("Error fetching route directions", error=str(e))
-        raise HTTPException(status_code=500, detail=f"Failed to get route directions: {str(e)}")
-
-def translate_instruction(instruction: str) -> str:
-    """Dịch hướng dẫn sang tiếng Việt (cơ bản)."""
-    translations = {
-        "Turn left": "Rẽ trái",
-        "Turn right": "Rẽ phải",
-        "Continue": "Tiếp tục đi thẳng",
-        "Take the ramp": "Đi vào đường dẫn",
-        "Arrive at destination": "Đến nơi",
-        "Head": "Đi thẳng",
-        "Turn around": "Quay đầu",
-        "Enter roundabout": "Vào vòng xuyến",
-        "Exit roundabout": "Rời vòng xuyến"
-    }
-    return translations.get(instruction, instruction)
+        logger.error("Review submission failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to submit review: {str(e)}")
