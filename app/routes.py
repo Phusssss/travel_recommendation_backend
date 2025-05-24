@@ -64,7 +64,6 @@ class TravelRecommender:
             raise
 
     def load_destinations(self):
-        """Tải danh sách địa điểm từ database và sử dụng sentiment_score nếu có."""
         try:
             conn = mysql.connector.connect(
                 host=os.getenv("DB_HOST", "db"),
@@ -73,20 +72,25 @@ class TravelRecommender:
                 database=os.getenv("DB_NAME", "travel_recommendation")
             )
             cursor = conn.cursor(dictionary=True)
-            cursor.execute("SELECT * FROM destinations WHERE city_id = %s", (self.city_id,))
+            cursor.execute("SELECT id, name, type, ticket_price, popularity, sentiment_score FROM destinations WHERE city_id = %s", (self.city_id,))
             self.destinations = cursor.fetchall()
             self.n_states = len(self.destinations)
+            
+            # Lấy hình ảnh cho mỗi địa điểm
+            for dest in self.destinations:
+                cursor.execute("SELECT image_url FROM destination_images WHERE destination_id = %s", (dest["id"],))
+                images = [row["image_url"] for row in cursor.fetchall()]
+                dest["images"] = images  # Thêm danh sách hình ảnh vào địa điểm
+
             cursor.close()
             conn.close()
             logger.info("Loaded destinations", city=self.city, count=self.n_states)
             if not self.destinations:
                 logger.error("No destinations found", city=self.city)
                 raise ValueError(f"No destinations found for city {self.city}")
-            # Tính sentiment_score nếu chưa có
             for dest in self.destinations:
                 if dest["sentiment_score"] is None:
                     dest["sentiment_score"] = self.calculate_destination_sentiment(dest["id"])
-                    # Lưu vào database
                     conn = mysql.connector.connect(
                         host=os.getenv("DB_HOST", "db"),
                         user=os.getenv("DB_USER", "root"),
@@ -240,7 +244,6 @@ class TravelRecommender:
         return reward
 
     def recommend_route(self, user_prefs: dict, steps: int) -> list:
-        """Đề xuất lộ trình du lịch dựa trên Q-table, sở thích và cảm xúc."""
         if self.q_table is None:
             self.load_q_table()
         if not np.any(self.q_table):
@@ -297,7 +300,8 @@ class TravelRecommender:
                 "temperature": weather.get("temperature", "N/A"),
                 "travel_time": travel_time.get("duration", "N/A"),
                 "ticket_price": ticket_price,
-                "sentiment_score": self.destinations[action].get("sentiment_score", 0.0)
+                "sentiment_score": self.destinations[action].get("sentiment_score", 0.0),
+                "images": self.destinations[action].get("images", [])
             })
             visited.add(destination)
             current_state = action
@@ -305,7 +309,44 @@ class TravelRecommender:
         if not route:
             raise ValueError("Could not generate a valid route")
         return route
+@router.get("/destination/{destination_id}")
+async def get_destination_details(destination_id: int):
+    """Endpoint để lấy chi tiết một địa điểm và các bình luận."""
+    try:
+        conn = mysql.connector.connect(
+            host=os.getenv("DB_HOST", "db"),
+            user=os.getenv("DB_USER", "root"),
+            password=os.getenv("DB_PASSWORD"),
+            database=os.getenv("DB_NAME", "travel_recommendation")
+        )
+        cursor = conn.cursor(dictionary=True)
 
+        # Lấy thông tin địa điểm
+        cursor.execute("SELECT id, name, type, ticket_price, popularity, sentiment_score FROM destinations WHERE id = %s", (destination_id,))
+        destination = cursor.fetchone()
+        if not destination:
+            cursor.close()
+            conn.close()
+            raise HTTPException(status_code=404, detail="Destination not found")
+
+        # Lấy danh sách hình ảnh
+        cursor.execute("SELECT image_url FROM destination_images WHERE destination_id = %s", (destination_id,))
+        destination["images"] = [row["image_url"] for row in cursor.fetchall()]
+
+        # Lấy các bình luận
+        cursor.execute("SELECT review_text, sentiment_score, created_at FROM reviews WHERE destination_id = %s ORDER BY created_at DESC", (destination_id,))
+        reviews = cursor.fetchall()
+
+        cursor.close()
+        conn.close()
+
+        return {
+            "destination": destination,
+            "reviews": reviews
+        }
+    except Exception as e:
+        logger.error("Error fetching destination details", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to fetch destination details: {str(e)}")
 @router.post("/train")
 async def train_model(request: dict = Body(...)):
     """Endpoint để huấn luyện mô hình."""
